@@ -1,0 +1,163 @@
+require("dotenv").config();
+
+const express = require("express");
+const Database = require("better-sqlite3");
+const { Rcon } = require("rcon-client");
+const crypto = require("crypto");
+
+const app = express();
+const db = new Database("endmc.sqlite");
+
+app.use(express.json());
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS orders (
+  code TEXT PRIMARY KEY,
+  player TEXT NOT NULL,
+  amount INTEGER NOT NULL,
+  status TEXT DEFAULT 'pending'
+);
+
+CREATE TABLE IF NOT EXISTS transactions (
+  id INTEGER PRIMARY KEY
+);
+`);
+
+function safePlayer(name) {
+  return /^[a-zA-Z0-9_]{3,16}$/.test(name);
+}
+
+async function command(cmd) {
+  const rcon = await Rcon.connect({
+    host: process.env.RCON_HOST,
+    port: Number(process.env.RCON_PORT),
+    password: process.env.RCON_PASSWORD
+  });
+
+  try {
+    return await rcon.send(cmd);
+  } finally {
+    await rcon.end();
+  }
+}
+
+// Tạo đơn hàng
+app.post("/create-order", (req, res) => {
+  if (req.headers.authorization !==
+      `Bearer ${process.env.ADMIN_TOKEN}`) {
+    return res.sendStatus(401);
+  }
+
+  const { player, amount } = req.body;
+
+  if (!safePlayer(player) ||
+      ![10000, 20000, 50000, 100000].includes(amount)) {
+    return res.sendStatus(400);
+  }
+
+  const code = "ENDMC" +
+    crypto.randomBytes(5).toString("hex").toUpperCase();
+
+  db.prepare(`
+    INSERT INTO orders (code, player, amount)
+    VALUES (?, ?, ?)
+  `).run(code, player, amount);
+
+  res.json({
+    success: true,
+    player,
+    amount,
+    transfer_content: code
+  });
+});
+
+// Nhận giao dịch SePay
+app.post("/webhook/sepay", async (req, res) => {
+  const auth = req.headers.authorization;
+
+  if (auth !== `Apikey ${process.env.SEPAY_API_KEY}`) {
+    return res.sendStatus(401);
+  }
+
+  const tx = req.body;
+
+  if (!tx.id || tx.transferType !== "in") {
+    return res.sendStatus(400);
+  }
+
+  const code = String(tx.content || "").match(/ENDMC[A-F0-9]{10}/)?.[0];
+
+  if (!code) {
+    return res.json({ success: true });
+  }
+
+  const order = db.prepare(
+    "SELECT * FROM orders WHERE code = ?"
+  ).get(code);
+
+  if (!order || order.status !== "pending") {
+    return res.json({ success: true });
+  }
+
+  if (Number(tx.transferAmount) < order.amount) {
+    return res.sendStatus(400);
+  }
+
+  const exists = db.prepare(
+    "SELECT id FROM transactions WHERE id = ?"
+  ).get(tx.id);
+
+  if (exists) {
+    return res.json({ success: true });
+  }
+
+  // Ghi nhận giao dịch trước khi thực hiện cấp quyền
+  db.prepare("INSERT INTO transactions (id) VALUES (?)").run(tx.id);
+
+  const update = db.prepare(`
+    UPDATE orders SET status = 'processing'
+    WHERE code = ? AND status = 'pending'
+  `).run(code);
+
+  if (!update.changes) {
+    return res.json({ success: true });
+  }
+
+  try {
+    const player = order.player;
+    const amount = order.amount;
+
+    // Cộng Vault
+    await command(`eco give ${player} ${amount / 1000}`);
+
+    // Cộng Point
+    await command(`points give ${player} ${amount / 1000}`);
+
+    // Cấp rank theo gói
+    if (amount >= 100000) {
+      await command(`lp user ${player} parent add mvp`);
+    } else if (amount >= 50000) {
+      await command(`lp user ${player} parent add vip`);
+    }
+
+    db.prepare(`
+      UPDATE orders SET status = 'completed'
+      WHERE code = ?
+    `).run(code);
+
+    res.json({ success: true });
+
+  } catch (error) {
+    console.error(error);
+    db.prepare(`
+      UPDATE orders SET status = 'failed'
+      WHERE code = ?
+    `).run(code);
+
+    res.sendStatus(500);
+  }
+});
+
+app.listen(process.env.PORT || 3000, () => {
+  console.log("ENDMC SePay Webhook is running!");
+});
